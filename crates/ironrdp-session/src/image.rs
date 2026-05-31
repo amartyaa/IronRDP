@@ -1142,7 +1142,12 @@ mod tests {
             bottom: 3, // height = 2
         };
 
-        let result = image.apply_rgb32_bitmap(&bitmap_data, PixelFormat::RgbA32, &blit_rect, data_stride as u16);
+        let result = image.apply_rgb32_bitmap(
+            &bitmap_data,
+            PixelFormat::RgbA32,
+            &blit_rect,
+            u16::try_from(data_stride).unwrap(),
+        );
         assert!(result.is_ok());
 
         let img_stride = 10 * 4; // image width * bpp
