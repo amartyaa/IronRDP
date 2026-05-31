@@ -305,7 +305,12 @@ impl Processor {
                         15 => image.apply_rgb15_bitmap(update.bitmap_data, &blit_rect, clipped_width)?,
                         16 => image.apply_rgb16_bitmap(update.bitmap_data, &blit_rect, clipped_width)?,
                         24 => image.apply_bgr24_bitmap(update.bitmap_data, &blit_rect, clipped_width)?,
-                        32 => image.apply_rgb32_bitmap(update.bitmap_data, PixelFormat::BgrX32, &blit_rect, clipped_width)?,
+                        32 => image.apply_rgb32_bitmap(
+                            update.bitmap_data,
+                            PixelFormat::BgrX32,
+                            &blit_rect,
+                            clipped_width,
+                        )?,
                         _ => {
                             warn!("Unsupported uncompressed bitmap depth: {bpp} bpp");
                             update.rectangle.clone()
@@ -488,13 +493,21 @@ impl Processor {
                             let ext_data = bits.extended_bitmap_data;
                             let dest_width = destination.width();
                             let rectangle = match ext_data.bpp {
-                                8 => {
-                                    image.apply_rgb8_with_palette(ext_data.data, &destination, self.palette.colors(), dest_width)?
-                                }
+                                8 => image.apply_rgb8_with_palette(
+                                    ext_data.data,
+                                    &destination,
+                                    self.palette.colors(),
+                                    dest_width,
+                                )?,
                                 15 => image.apply_rgb15_bitmap(ext_data.data, &destination, dest_width)?,
                                 16 => image.apply_rgb16_bitmap(ext_data.data, &destination, dest_width)?,
                                 24 => image.apply_bgr24_bitmap(ext_data.data, &destination, dest_width)?,
-                                32 => image.apply_rgb32_bitmap(ext_data.data, PixelFormat::BgrX32, &destination, dest_width)?,
+                                32 => image.apply_rgb32_bitmap(
+                                    ext_data.data,
+                                    PixelFormat::BgrX32,
+                                    &destination,
+                                    dest_width,
+                                )?,
                                 bpp => {
                                     warn!("Unsupported surface CODEC_ID_NONE bpp: {bpp}");
                                     continue;

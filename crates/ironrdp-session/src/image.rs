@@ -202,7 +202,11 @@ impl DecodedImage {
         let end =
             start + usize::from(rect.height() - 1) * self.stride() + usize::from(rect.width()) * self.bytes_per_pixel();
 
-        debug_assert!(end <= self.data.len(), "data_for_rect end {end} exceeds data len {}", self.data.len());
+        debug_assert!(
+            end <= self.data.len(),
+            "data_for_rect end {end} exceeds data len {}",
+            self.data.len()
+        );
 
         &self.data[start..end]
     }
@@ -601,7 +605,11 @@ impl DecodedImage {
                         );
                         let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
 
-                        debug_assert!(dst_idx + DST_COLOR_DEPTH <= self.data.len(), "rgb16 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}", self.data.len());
+                        debug_assert!(
+                            dst_idx + DST_COLOR_DEPTH <= self.data.len(),
+                            "rgb16 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}",
+                            self.data.len()
+                        );
                         let [r, g, b] = rdp_16bit_to_rgb(rgb16_value);
                         self.data[dst_idx + ri] = r;
                         self.data[dst_idx + gi] = g;
@@ -658,7 +666,11 @@ impl DecodedImage {
                         );
                         let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
 
-                        debug_assert!(dst_idx + DST_COLOR_DEPTH <= self.data.len(), "rgb15 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}", self.data.len());
+                        debug_assert!(
+                            dst_idx + DST_COLOR_DEPTH <= self.data.len(),
+                            "rgb15 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}",
+                            self.data.len()
+                        );
                         let [r, g, b] = rdp_15bit_to_rgb(rgb15_value);
                         self.data[dst_idx + ri] = r;
                         self.data[dst_idx + gi] = g;
@@ -712,7 +724,11 @@ impl DecodedImage {
                     .for_each(|(col_idx, src_pixel)| {
                         let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
 
-                        debug_assert!(dst_idx + DST_COLOR_DEPTH <= self.data.len(), "bgr24 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}", self.data.len());
+                        debug_assert!(
+                            dst_idx + DST_COLOR_DEPTH <= self.data.len(),
+                            "bgr24 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}",
+                            self.data.len()
+                        );
                         // BGR -> RGB channel swap
                         self.data[dst_idx + ri] = src_pixel[2];
                         self.data[dst_idx + gi] = src_pixel[1];
@@ -759,15 +775,22 @@ impl DecodedImage {
             .rev()
             .enumerate()
             .for_each(|(row_idx, row)| {
-                row.iter().take(rectangle_width).enumerate().for_each(|(col_idx, &index)| {
-                    let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
-                    debug_assert!(dst_idx + DST_COLOR_DEPTH <= self.data.len(), "rgb8 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}", self.data.len());
-                    let [r, g, b] = palette[usize::from(index)];
-                    self.data[dst_idx + ri] = r;
-                    self.data[dst_idx + gi] = g;
-                    self.data[dst_idx + bi] = b;
-                    self.data[dst_idx + ai] = 0xff;
-                })
+                row.iter()
+                    .take(rectangle_width)
+                    .enumerate()
+                    .for_each(|(col_idx, &index)| {
+                        let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
+                        debug_assert!(
+                            dst_idx + DST_COLOR_DEPTH <= self.data.len(),
+                            "rgb8 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}",
+                            self.data.len()
+                        );
+                        let [r, g, b] = palette[usize::from(index)];
+                        self.data[dst_idx + ri] = r;
+                        self.data[dst_idx + gi] = g;
+                        self.data[dst_idx + bi] = b;
+                        self.data[dst_idx + ai] = 0xff;
+                    })
             });
 
         let update_rectangle = self.pointer_rendering_end(pointer_rendering_state)?;
@@ -811,7 +834,11 @@ impl DecodedImage {
                 .for_each(|(col_idx, src_pixel)| {
                     let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
 
-                    debug_assert!(dst_idx + DST_COLOR_DEPTH <= self.data.len(), "rgb24 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}", self.data.len());
+                    debug_assert!(
+                        dst_idx + DST_COLOR_DEPTH <= self.data.len(),
+                        "rgb24 dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}",
+                        self.data.len()
+                    );
                     self.data[dst_idx + ri] = src_pixel[0];
                     self.data[dst_idx + gi] = src_pixel[1];
                     self.data[dst_idx + bi] = src_pixel[2];
@@ -879,7 +906,11 @@ impl DecodedImage {
                         .for_each(|(col_idx, src_pixel)| {
                             let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
 
-                            debug_assert!(dst_idx + SRC_COLOR_DEPTH <= self.data.len(), "rgb32 same-format dst_idx out of bounds: {dst_idx} + {SRC_COLOR_DEPTH} > {}", self.data.len());
+                            debug_assert!(
+                                dst_idx + SRC_COLOR_DEPTH <= self.data.len(),
+                                "rgb32 same-format dst_idx out of bounds: {dst_idx} + {SRC_COLOR_DEPTH} > {}",
+                                self.data.len()
+                            );
                             self.data[dst_idx..dst_idx + SRC_COLOR_DEPTH].copy_from_slice(src_pixel);
                         })
                 });
@@ -896,7 +927,11 @@ impl DecodedImage {
                         .try_for_each(|(col_idx, src_pixel)| {
                             let dst_idx = ((top + row_idx) * image_width + left + col_idx) * DST_COLOR_DEPTH;
 
-                            debug_assert!(dst_idx + DST_COLOR_DEPTH <= self.data.len(), "rgb32 cross-format dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}", self.data.len());
+                            debug_assert!(
+                                dst_idx + DST_COLOR_DEPTH <= self.data.len(),
+                                "rgb32 cross-format dst_idx out of bounds: {dst_idx} + {DST_COLOR_DEPTH} > {}",
+                                self.data.len()
+                            );
                             let c = format
                                 .read_color(src_pixel)
                                 .map_err(|err| custom_err!("read color", err))?;
@@ -949,7 +984,7 @@ mod tests {
         // Fill row 0 (bottom row in bitmap → last screen row after .rev())
         for col in 0..rect_width {
             let idx = col * bpp;
-            bitmap_data[idx] = 0xAA;     // R
+            bitmap_data[idx] = 0xAA; // R
             bitmap_data[idx + 1] = 0xBB; // G
             bitmap_data[idx + 2] = 0xCC; // B
             bitmap_data[idx + 3] = 0xFF; // A
@@ -957,7 +992,7 @@ mod tests {
         // Fill row 1 (top row in bitmap → first screen row after .rev())
         for col in 0..rect_width {
             let idx = (rect_width + col) * bpp;
-            bitmap_data[idx] = 0x11;     // R
+            bitmap_data[idx] = 0x11; // R
             bitmap_data[idx + 1] = 0x22; // G
             bitmap_data[idx + 2] = 0x33; // B
             bitmap_data[idx + 3] = 0xFF; // A
@@ -966,7 +1001,7 @@ mod tests {
         let blit_rect = InclusiveRectangle {
             left: 2,
             top: 3,
-            right: 4, // width = 3
+            right: 4,  // width = 3
             bottom: 4, // height = 2
         };
 
@@ -1107,12 +1142,7 @@ mod tests {
             bottom: 3, // height = 2
         };
 
-        let result = image.apply_rgb32_bitmap(
-            &bitmap_data,
-            PixelFormat::RgbA32,
-            &blit_rect,
-            data_stride as u16,
-        );
+        let result = image.apply_rgb32_bitmap(&bitmap_data, PixelFormat::RgbA32, &blit_rect, data_stride as u16);
         assert!(result.is_ok());
 
         let img_stride = 10 * 4; // image width * bpp
@@ -1121,10 +1151,7 @@ mod tests {
         // After .rev(), bitmap row 1 → screen row_idx 0 (y=2).
         for col in 0..rect_width {
             let px = 2 * img_stride + (1 + col) * 4;
-            assert_eq!(
-                image.data[px], 0x11,
-                "pixel at col {col} should be 0x11 (within rect)"
-            );
+            assert_eq!(image.data[px], 0x11, "pixel at col {col} should be 0x11 (within rect)");
         }
 
         // Verify that column 6 (x = 1 + 5 = 6) was NOT written (padding was discarded).
@@ -1135,4 +1162,3 @@ mod tests {
         );
     }
 }
-
