@@ -258,6 +258,27 @@ pub struct Config {
     /// [\[MS-RDPBCGR\] 2.2.1.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/861f2bbb-6ca2-4c5a-8c44-0714fa901e70
     /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
     pub multitransport_flags: Option<gcc::MultiTransportFlags>,
+
+    /// Monitor layout to advertise in the [`ClientMonitorData`] (`TS_UD_CS_MONITOR`)
+    /// GCC block for multi-monitor sessions.
+    ///
+    /// When empty (the default), no monitor block is sent and the session is
+    /// single-monitor, sized by [`Config::desktop_size`] — identical to the
+    /// behavior before multi-monitor support was added. When non-empty, exactly
+    /// one [`gcc::Monitor`] should have [`gcc::MonitorFlags::PRIMARY`] set, and
+    /// [`Config::desktop_size`] should equal the bounding box of all monitors.
+    ///
+    /// [`ClientMonitorData`]: ironrdp_pdu::gcc::ClientMonitorData
+    pub monitors: Vec<gcc::Monitor>,
+
+    /// Optional per-monitor extended info (`TS_UD_CS_MONITOR_EX`): physical size,
+    /// orientation, and DPI scale factors.
+    ///
+    /// When empty, no extended block is sent. When non-empty, it must have the
+    /// same length and order as [`Config::monitors`].
+    ///
+    /// [`ClientMonitorExtendedData`]: ironrdp_pdu::gcc::ClientMonitorExtendedData
+    pub monitors_extended: Vec<gcc::ExtendedMonitorInfo>,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);

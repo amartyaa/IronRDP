@@ -5,7 +5,7 @@ use ironrdp_svc::{ChannelFlags, SvcMessage};
 use tracing::debug;
 
 use crate::CHANNEL_NAME;
-use crate::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu};
+use crate::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, DisplayControlPdu, MonitorLayoutEntry};
 
 /// A client for the Display Control Virtual Channel.
 pub struct DisplayControlClient {
@@ -60,6 +60,16 @@ impl DisplayControlClient {
         let pdu: DisplayControlPdu =
             DisplayControlMonitorLayout::new_single_primary_monitor(width, height, scale_factor, physical_dims)?.into();
         debug!(?pdu, "Sending monitor layout");
+        encode_dvc_messages(channel_id, vec![Box::new(pdu)], ChannelFlags::empty())
+    }
+
+    /// Builds a [`DisplayControlPdu::MonitorLayout`] from an explicit list of
+    /// monitors and wraps it as an [`SvcMessage`]. Used for multi-monitor
+    /// (re)layout. Exactly one entry must be primary (validated by
+    /// [`DisplayControlMonitorLayout::new`]).
+    pub fn encode_monitors(&self, channel_id: u32, monitors: &[MonitorLayoutEntry]) -> EncodeResult<Vec<SvcMessage>> {
+        let pdu: DisplayControlPdu = DisplayControlMonitorLayout::new(monitors)?.into();
+        debug!(?pdu, "Sending multi-monitor layout");
         encode_dvc_messages(channel_id, vec![Box::new(pdu)], ChannelFlags::empty())
     }
 }

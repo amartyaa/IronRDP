@@ -303,6 +303,38 @@ impl ActiveStage {
         None
     }
 
+    /// Encodes a multi-monitor layout to send over the Display Control Virtual
+    /// Channel (MS-RDPEDISP). Mirrors [`Self::encode_resize`] but takes an
+    /// explicit list of monitors. Returns `None` if the channel is unavailable
+    /// or not yet connected.
+    ///
+    /// Exactly one entry must be primary (validated downstream by
+    /// [`ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout::new`]).
+    pub fn encode_monitor_layout(
+        &mut self,
+        monitors: &[ironrdp_displaycontrol::pdu::MonitorLayoutEntry],
+    ) -> Option<SessionResult<Vec<u8>>> {
+        if let Some(dvc) = self.get_dvc::<DisplayControlClient>() {
+            if let Some(channel_id) = dvc.channel_id() {
+                let display_control = dvc.channel_processor_downcast_ref::<DisplayControlClient>()?;
+                let svc_messages = match display_control.encode_monitors(channel_id, monitors) {
+                    Ok(messages) => messages,
+                    Err(e) => return Some(Err(SessionError::encode(e))),
+                };
+
+                return Some(
+                    self.process_svc_processor_messages(SvcProcessorMessages::<DrdynvcClient>::new(svc_messages)),
+                );
+            } else {
+                debug!("Could not encode a monitor layout: Display Control Virtual Channel is not yet connected");
+            }
+        } else {
+            debug!("Could not encode a monitor layout: Display Control Virtual Channel is not available");
+        }
+
+        None
+    }
+
     pub fn encode_dvc_messages(&mut self, messages: Vec<SvcMessage>) -> SessionResult<Vec<u8>> {
         self.process_svc_processor_messages(SvcProcessorMessages::<DrdynvcClient>::new(messages))
     }

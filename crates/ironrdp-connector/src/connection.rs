@@ -734,13 +734,21 @@ fn create_gcc_blocks<'a>(
         },
         // TODO(#139): support for Some(ClientClusterData { flags: RedirectionFlags::REDIRECTION_SUPPORTED, redirection_version: RedirectionVersion::V4, redirected_session_id: 0, }),
         cluster: None,
-        monitor: None,
+        // Multi-monitor: send the monitor layout only when one was configured.
+        // An empty list keeps the legacy single-monitor behavior (no block).
+        monitor: (!config.monitors.is_empty()).then(|| gcc::ClientMonitorData {
+            monitors: config.monitors.clone(),
+        }),
         // TODO(#140): support for Client Message Channel Data (https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/f50e791c-de03-4b25-b17e-e914c9020bc3)
         message_channel: None,
         multi_transport_channel: config
             .multitransport_flags
             .map(|flags| gcc::MultiTransportChannelData { flags }),
-        monitor_extended: None,
+        monitor_extended: (!config.monitors_extended.is_empty()).then(|| {
+            gcc::ClientMonitorExtendedData {
+                extended_monitors_info: config.monitors_extended.clone(),
+            }
+        }),
     })
 }
 
