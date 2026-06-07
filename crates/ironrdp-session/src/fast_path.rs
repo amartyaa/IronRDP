@@ -25,6 +25,11 @@ use crate::{SessionError, SessionErrorExt as _, SessionResult, custom_err, reaso
 pub enum UpdateKind {
     None,
     Region(InclusiveRectangle),
+    /// A server graphics frame opened (TS_FRAME_MARKER BEGIN). Lets the client
+    /// gate presentation so a multi-tile frame can be shown atomically on END.
+    FrameBegin,
+    /// A server graphics frame closed (TS_FRAME_MARKER END).
+    FrameEnd,
     PointerDefault,
     PointerHidden,
     PointerPosition { x: u16, y: u16 },
@@ -147,8 +152,15 @@ impl Processor {
         match update {
             Ok(FastPathUpdate::SurfaceCommands(surface_commands)) => {
                 trace!("Received Surface Commands: {} pieces", surface_commands.len());
-                let update_region = self.process_surface_commands(image, output, surface_commands)?;
+                let (update_region, frame_begin, frame_end) =
+                    self.process_surface_commands(image, output, surface_commands)?;
+                if frame_begin {
+                    processor_updates.push(UpdateKind::FrameBegin);
+                }
                 processor_updates.push(UpdateKind::Region(update_region));
+                if frame_end {
+                    processor_updates.push(UpdateKind::FrameEnd);
+                }
             }
             Ok(FastPathUpdate::Bitmap(bitmap_update)) => {
                 trace!("Received bitmap update");
@@ -456,13 +468,17 @@ impl Processor {
         Ok(processor_updates)
     }
 
+    /// Returns the unioned update rectangle plus whether a frame BEGIN and/or END
+    /// marker was seen in this batch, so the caller can gate presentation.
     fn process_surface_commands(
         &mut self,
         image: &mut DecodedImage,
         output: &mut WriteBuf,
         surface_commands: Vec<SurfaceCommand<'_>>,
-    ) -> SessionResult<InclusiveRectangle> {
+    ) -> SessionResult<(InclusiveRectangle, bool, bool)> {
         let mut update_rectangle = None;
+        let mut frame_begin = false;
+        let mut frame_end = false;
 
         for command in surface_commands {
             match command {
@@ -568,12 +584,20 @@ impl Processor {
                         marker.frame_action,
                         marker.frame_id.unwrap_or(0)
                     );
+                    match marker.frame_action {
+                        FrameAction::Begin => frame_begin = true,
+                        FrameAction::End => frame_end = true,
+                    }
                     self.marker_processor.process(&marker, output)?;
                 }
             }
         }
 
-        Ok(update_rectangle.unwrap_or_else(InclusiveRectangle::empty))
+        Ok((
+            update_rectangle.unwrap_or_else(InclusiveRectangle::empty),
+            frame_begin,
+            frame_end,
+        ))
     }
 }
 

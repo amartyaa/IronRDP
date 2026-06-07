@@ -178,6 +178,12 @@ impl ActiveStage {
                 UpdateKind::Region(region) => {
                     stage_outputs.push(ActiveStageOutput::GraphicsUpdate(region));
                 }
+                UpdateKind::FrameBegin => {
+                    stage_outputs.push(ActiveStageOutput::FrameBegin);
+                }
+                UpdateKind::FrameEnd => {
+                    stage_outputs.push(ActiveStageOutput::FrameEnd);
+                }
                 UpdateKind::PointerDefault => {
                     stage_outputs.push(ActiveStageOutput::PointerDefault);
                 }
@@ -344,6 +350,11 @@ impl ActiveStage {
 pub enum ActiveStageOutput {
     ResponseFrame(Vec<u8>),
     GraphicsUpdate(InclusiveRectangle),
+    /// A server graphics frame opened (TS_FRAME_MARKER BEGIN). Clients may use
+    /// this to accumulate `GraphicsUpdate`s and present the whole frame atomically.
+    FrameBegin,
+    /// A server graphics frame closed (TS_FRAME_MARKER END).
+    FrameEnd,
     PointerDefault,
     PointerHidden,
     PointerPosition {
