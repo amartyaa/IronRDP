@@ -257,6 +257,26 @@ pub trait GraphicsPipelineHandler: Send {
     /// surface ID, destination rectangle, and RGBA pixel data.
     fn on_bitmap_updated(&mut self, _update: &BitmapUpdate) {}
 
+    /// Called in raw AVC420 passthrough mode with the undecoded H.264 bitstream.
+    ///
+    /// Used when the client is built with [`GraphicsPipelineClient::new_passthrough`]
+    /// (no synchronous [`H264Decoder`]): instead of decoding inline, the client
+    /// forwards the raw AVC420 NAL units (AVC format — 4-byte big-endian length
+    /// prefix per NAL, *not* Annex B) plus the resolved output geometry, so the
+    /// embedder can decode asynchronously (e.g. via the browser's WebCodecs
+    /// `VideoDecoder`). `origin_x`/`origin_y` are the surface's mapped output
+    /// position; `width`/`height` are the surface dimensions for cropping.
+    fn on_avc420_raw(
+        &mut self,
+        _surface_id: u16,
+        _origin_x: u32,
+        _origin_y: u32,
+        _width: u16,
+        _height: u16,
+        _data: &[u8],
+    ) {
+    }
+
     /// Called when a logical frame is complete
     ///
     /// All bitmap updates between the corresponding `StartFrame`
@@ -381,6 +401,10 @@ enum ClientState {
 pub struct GraphicsPipelineClient {
     handler: Box<dyn GraphicsPipelineHandler>,
     h264_decoder: Option<Box<dyn H264Decoder>>,
+    /// Raw AVC420 passthrough: advertise AVC420 (no sync decoder) and forward
+    /// undecoded H.264 to [`GraphicsPipelineHandler::on_avc420_raw`] for async
+    /// decode. See [`GraphicsPipelineClient::new_passthrough`].
+    avc_passthrough: bool,
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
@@ -403,6 +427,7 @@ impl GraphicsPipelineClient {
         Self {
             handler,
             h264_decoder,
+            avc_passthrough: false,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             state: ClientState::WaitingForConfirm,
@@ -413,6 +438,18 @@ impl GraphicsPipelineClient {
             frames_queued: 0,
             total_frames_decoded: 0,
         }
+    }
+
+    /// Create a new `GraphicsPipelineClient` in raw AVC420 passthrough mode.
+    ///
+    /// No synchronous [`H264Decoder`] is used; AVC420 is still advertised, and
+    /// each AVC420 frame's raw H.264 bitstream is forwarded to
+    /// [`GraphicsPipelineHandler::on_avc420_raw`] for asynchronous decoding by
+    /// the embedder (e.g. WebCodecs). All other PDUs are handled normally.
+    pub fn new_passthrough(handler: Box<dyn GraphicsPipelineHandler>) -> Self {
+        let mut client = Self::new(handler, None);
+        client.avc_passthrough = true;
+        client
     }
 
     // ========================================================================
@@ -712,6 +749,22 @@ impl GraphicsPipelineClient {
         let mut cursor = ReadCursor::new(bitmap_data);
         let stream = Avc420BitmapStream::decode(&mut cursor).map_err(|e| decode_err!(e))?;
 
+        // Raw passthrough: forward the undecoded H.264 + resolved output geometry
+        // to the handler for async decode (e.g. WebCodecs). The decoder
+        // reconstructs the full surface every frame, so we hand over the surface
+        // origin/size; per-region rects are an optional dirty-blit optimization we
+        // skip here (a full-frame blit is always correct for H.264).
+        if self.avc_passthrough {
+            let (origin_x, origin_y, width, height) = match self.surfaces.get(&surface_id) {
+                Some(s) => (s.output_origin_x, s.output_origin_y, s.width, s.height),
+                None => (0, 0, dest_rect.width(), dest_rect.height()),
+            };
+            trace!(surface_id, data_len = stream.data.len(), "AVC420 raw passthrough");
+            self.handler
+                .on_avc420_raw(surface_id, origin_x, origin_y, width, height, stream.data);
+            return Ok(());
+        }
+
         let Some(ref mut decoder) = self.h264_decoder else {
             debug!("No H.264 decoder configured, skipping AVC420 frame");
             return Ok(());
@@ -803,7 +856,9 @@ impl DvcProcessor for GraphicsPipelineClient {
     }
 
     fn start(&mut self, _channel_id: u32) -> PduResult<Vec<DvcMessage>> {
-        let caps = if self.h264_decoder.is_some() {
+        let caps = if self.h264_decoder.is_some() || self.avc_passthrough {
+            // A sync decoder or raw passthrough can both handle AVC420 — advertise
+            // the handler's full capability set (including AVC-capable versions).
             self.handler.capabilities()
         } else {
             // No H.264 decoder: filter out capability sets that imply AVC support.

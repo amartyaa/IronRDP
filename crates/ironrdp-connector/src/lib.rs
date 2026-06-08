@@ -279,6 +279,20 @@ pub struct Config {
     ///
     /// [`ClientMonitorExtendedData`]: ironrdp_pdu::gcc::ClientMonitorExtendedData
     pub monitors_extended: Vec<gcc::ExtendedMonitorInfo>,
+
+    /// Advertise support for the Graphics Pipeline dynamic virtual channel
+    /// (MS-RDPEGFX) by setting `SUPPORT_DYN_VC_GFX_PROTOCOL` in the client core
+    /// data early capability flags.
+    ///
+    /// When `true`, a capable server (e.g. Windows) will open the
+    /// `Microsoft::Windows::RDS::Graphics` DVC and deliver graphics via the
+    /// pipeline (RFX Progressive / H.264 AVC420/444) instead of the legacy
+    /// surface/bitmap path. The client MUST attach a graphics-pipeline DVC
+    /// handler (via DRDYNVC) to actually render those frames; advertising this
+    /// without a handler results in a blank session on such servers.
+    ///
+    /// Defaults to `false` (legacy graphics), preserving prior behavior.
+    pub support_graphics_pipeline: bool,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);

@@ -703,6 +703,14 @@ fn create_gcc_blocks<'a>(
                         early_capability_flags |= ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;
                     }
 
+                    // Advertise the Graphics Pipeline (MS-RDPEGFX) so a capable
+                    // server opens the graphics DVC and delivers H.264/RFX-progressive
+                    // frames. Gated by config so clients without a GFX handler keep
+                    // the legacy graphics path.
+                    if config.support_graphics_pipeline {
+                        early_capability_flags |= ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
+
                     Some(early_capability_flags)
                 },
                 dig_product_id: Some(config.dig_product_id.clone()),

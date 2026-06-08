@@ -36,6 +36,10 @@ pub use ironrdp_echo as echo;
 #[doc(inline)]
 pub use ironrdp_dvc as dvc;
 
+#[cfg(feature = "egfx")]
+#[doc(inline)]
+pub use ironrdp_egfx as egfx;
+
 #[cfg(feature = "graphics")]
 #[doc(inline)]
 pub use ironrdp_graphics as graphics;
