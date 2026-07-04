@@ -422,12 +422,137 @@ fn decode_subcodecs(layer: &[u8], w: usize, h: usize, out: &mut [u8]) -> ClearRe
                 }
             }
             2 => decode_rlex(data, sw, sh, x_start, y_start, w, h, out)?,
-            1 => return Err(ClearDecodeError("NSCodec subcodec not supported")),
+            1 => decode_nscodec(data, sw, sh, x_start, y_start, w, out)?,
             _ => return Err(ClearDecodeError("unknown subcodec id")),
         }
     }
 
     Ok(())
+}
+
+/// NSCodec (MS-RDPNSC) — used inside ClearCodec as `subCodecId = 1`.
+/// Four planes (luma Y, chroma Co/Cg, alpha) in AYCoCg color space, each
+/// plane independently either raw, byte-RLE compressed, or absent
+/// (absent = filled with 0xFF). Chroma planes are optionally 2×2 subsampled.
+/// Faithful port of FreeRDP's `nsc.c` decode path.
+fn decode_nscodec(
+    data: &[u8],
+    sw: usize,
+    sh: usize,
+    x_start: usize,
+    y_start: usize,
+    w: usize,
+    out: &mut [u8],
+) -> ClearResult<()> {
+    let mut r = Reader::new(data);
+
+    let mut plane_byte_count = [0usize; 4];
+    for count in &mut plane_byte_count {
+        *count = r.u32()? as usize;
+    }
+    let color_loss_level = r.u8()?;
+    if !(1..=7).contains(&color_loss_level) {
+        return Err(ClearDecodeError("NSCodec ColorLossLevel out of range"));
+    }
+    let chroma_subsampled = r.u8()? != 0;
+    let _reserved = r.u16()?;
+
+    // Rounded plane dimensions (MS-RDPNSC 3.1.8.3): luma rows padded to a
+    // multiple of 8 wide when subsampling; chroma planes are half-size in
+    // both dimensions (height rounded up to even first).
+    let rw = sw.div_ceil(8) * 8;
+    let rh = sh.div_ceil(2) * 2;
+    let mut org_byte_count = [sw * sh; 4];
+    if chroma_subsampled {
+        org_byte_count[0] = rw * sh;
+        org_byte_count[1] = (rw / 2) * (rh / 2);
+        org_byte_count[2] = org_byte_count[1];
+    }
+
+    // Decompress the four planes.
+    let mut planes: [Vec<u8>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for i in 0..4 {
+        let raw = r.bytes(plane_byte_count[i])?;
+        planes[i] = if plane_byte_count[i] == 0 {
+            vec![0xFF; org_byte_count[i]]
+        } else if plane_byte_count[i] < org_byte_count[i] {
+            nsc_rle_decode(raw, org_byte_count[i])?
+        } else {
+            raw.get(..org_byte_count[i])
+                .ok_or(ClearDecodeError("NSCodec raw plane short"))?
+                .to_vec()
+        };
+    }
+
+    // AYCoCg -> RGB. The chroma samples are stored quantized: shift left by
+    // (ColorLossLevel - 1), then reinterpret the low byte as signed.
+    let shift = u32::from(color_loss_level - 1);
+    for y in 0..sh {
+        let y_row = if chroma_subsampled { y * rw } else { y * sw };
+        let c_row = if chroma_subsampled { (y >> 1) * (rw >> 1) } else { y * sw };
+
+        for x in 0..sw {
+            let cx = if chroma_subsampled { c_row + x / 2 } else { c_row + x };
+            let luma = i16::from(*planes[0].get(y_row + x).ok_or(ClearDecodeError("NSCodec luma OOB"))?);
+            let co_q = *planes[1].get(cx).ok_or(ClearDecodeError("NSCodec chroma OOB"))?;
+            let cg_q = *planes[2].get(cx).ok_or(ClearDecodeError("NSCodec chroma OOB"))?;
+            let co = i16::from(((i16::from(co_q) << shift) as u8) as i8);
+            let cg = i16::from(((i16::from(cg_q) << shift) as u8) as i8);
+
+            let red = (luma + co - cg).clamp(0, 255) as u8;
+            let green = (luma + cg).clamp(0, 255) as u8;
+            let blue = (luma - co - cg).clamp(0, 255) as u8;
+
+            // ClearCodec composition keeps destination alpha; force opaque.
+            let dst = ((y_start + y) * w + x_start + x) * BYTES_PER_PIXEL;
+            out[dst..dst + BYTES_PER_PIXEL].copy_from_slice(&[red, green, blue, 0xFF]);
+        }
+    }
+
+    Ok(())
+}
+
+/// NSCodec plane RLE (MS-RDPNSC 2.2.2): byte-oriented runs. A value followed
+/// by an identical value introduces a run (third byte = length - 2, or a
+/// 0xFF escape followed by a 32-bit length); the final 4 bytes of every
+/// plane are always stored raw.
+fn nsc_rle_decode(input: &[u8], original_size: usize) -> ClearResult<Vec<u8>> {
+    let mut r = Reader::new(input);
+    let mut out = Vec::with_capacity(original_size);
+    let mut left = original_size;
+
+    while left > 4 {
+        let value = r.u8()?;
+
+        if left == 5 {
+            out.push(value);
+            left -= 1;
+        } else if r.remaining() == 0 {
+            return Err(ClearDecodeError("NSCodec RLE underrun"));
+        } else if input[r.pos] == value {
+            r.u8()?; // consume the duplicate
+            let marker = r.u8()?;
+            let len = if marker < 0xFF {
+                usize::from(marker) + 2
+            } else {
+                r.u32()? as usize
+            };
+            if len > left {
+                return Err(ClearDecodeError("NSCodec RLE run overflows plane"));
+            }
+            out.resize(out.len() + len, value);
+            left -= len;
+        } else {
+            out.push(value);
+            left -= 1;
+        }
+    }
+
+    if left != 4 {
+        return Err(ClearDecodeError("NSCodec RLE leaves wrong tail size"));
+    }
+    out.extend_from_slice(r.bytes(4)?);
+    Ok(out)
 }
 
 /// RLEX: a small palette (BGR triplets), then runs of `(background run,
@@ -595,6 +720,51 @@ mod tests {
             .decode(&hit, 7, 15, &mut out2)
             .unwrap_or_else(|e| panic!("glyph hit decode failed: {e}"));
         assert_eq!(out, out2);
+    }
+
+    #[test]
+    fn nscodec_raw_planes_gray() {
+        // 2x2 NSCodec sub-rect with raw (uncompressed) planes:
+        // Y=100, Co=0, Cg=0 -> r=g=b=100. ColorLossLevel=1, no subsampling.
+        let mut nsc = Vec::new();
+        for count in [4u32, 4, 4, 4] {
+            nsc.extend(count.to_le_bytes());
+        }
+        nsc.extend([1u8, 0, 0, 0]); // ColorLossLevel=1, no chroma subsampling, reserved
+        nsc.extend([100u8; 4]); // Y plane
+        nsc.extend([0u8; 4]); // Co plane
+        nsc.extend([0u8; 4]); // Cg plane
+        nsc.extend([0xFFu8; 4]); // A plane
+
+        // Wrap in a ClearCodec stream: header + subcodec layer only.
+        let mut src = vec![0u8, 0]; // glyphFlags, seqNumber
+        src.extend(0u32.to_le_bytes()); // residual
+        src.extend(0u32.to_le_bytes()); // bands
+        src.extend(u32::try_from(13 + nsc.len()).unwrap().to_le_bytes()); // subcodec bytes
+        src.extend(0u16.to_le_bytes()); // xStart
+        src.extend(0u16.to_le_bytes()); // yStart
+        src.extend(2u16.to_le_bytes()); // width
+        src.extend(2u16.to_le_bytes()); // height
+        src.extend(u32::try_from(nsc.len()).unwrap().to_le_bytes());
+        src.push(1); // subCodecId = NSCodec
+        src.extend_from_slice(&nsc);
+
+        let out = decode(2, 2, &src);
+        assert_eq!(out, [100u8, 100, 100, 0xFF].repeat(4));
+    }
+
+    #[test]
+    fn nscodec_rle_plane_roundtrip() {
+        // RLE: 12 x 0x37 (value, dup, len byte 10 => 10+2), then 4 raw tail bytes.
+        let rle = [0x37u8, 0x37, 10, 1, 2, 3, 4];
+        let plane = nsc_rle_decode(&rle, 16).expect("rle decode");
+        let mut expected = vec![0x37u8; 12];
+        expected.extend([1, 2, 3, 4]);
+        assert_eq!(plane, expected);
+
+        // A run that leaves fewer than 4 tail bytes must fail like FreeRDP.
+        let bad = [0x37u8, 0x37, 12, 1, 2, 3, 4];
+        assert!(nsc_rle_decode(&bad, 16).is_err());
     }
 
     #[test]
