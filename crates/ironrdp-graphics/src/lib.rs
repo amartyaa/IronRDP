@@ -11,6 +11,7 @@ pub mod pointer;
 pub mod quantization;
 pub mod rdp6;
 pub mod rectangle_processing;
+pub mod rfx_progressive;
 pub mod rle;
 pub mod rlgr;
 pub mod srl;

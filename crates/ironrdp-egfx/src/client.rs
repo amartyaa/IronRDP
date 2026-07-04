@@ -277,6 +277,24 @@ pub trait GraphicsPipelineHandler: Send {
     ) {
     }
 
+    /// Called with the raw RFX-Progressive bitmap stream from a `WireToSurface2`
+    /// PDU (MS-RDPEGFX 2.2.2.2 / MS-RDPRFX progressive). Unlike AVC, progressive
+    /// is decoded on the CPU, so the embedder owns a stateful decoder per surface
+    /// (the codec accumulates coefficients across upgrade passes). `origin_x`/
+    /// `origin_y` are the surface's mapped output position; `width`/`height` are
+    /// the surface dimensions. `data` is the undecoded progressive stream; tile
+    /// positions and dirty rectangles are encoded within it.
+    fn on_progressive_data(
+        &mut self,
+        _surface_id: u16,
+        _origin_x: u32,
+        _origin_y: u32,
+        _width: u16,
+        _height: u16,
+        _data: &[u8],
+    ) {
+    }
+
     /// Called when a logical frame is complete
     ///
     /// All bitmap updates between the corresponding `StartFrame`
@@ -408,6 +426,9 @@ pub struct GraphicsPipelineClient {
 
     decompressor: zgfx::Decompressor,
     decompressed_buffer: Vec<u8>,
+    /// RDP 6.0 Planar codec decoder (reused for its internal plane buffer).
+    /// xrdp's GFX delivers tiles via WireToSurface1 with `codecId = Planar`.
+    planar_decoder: ironrdp_graphics::rdp6::BitmapStreamDecoder,
 
     state: ClientState,
     negotiated_caps: Option<CapabilitySet>,
@@ -430,6 +451,7 @@ impl GraphicsPipelineClient {
             avc_passthrough: false,
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
+            planar_decoder: ironrdp_graphics::rdp6::BitmapStreamDecoder::default(),
             state: ClientState::WaitingForConfirm,
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
@@ -523,7 +545,22 @@ impl GraphicsPipelineClient {
                 Ok(vec![])
             }
             GfxPdu::WireToSurface2(pdu) => {
-                trace!("WireToSurface2 (progressive codec)");
+                // RFX-Progressive. Resolve the surface's output geometry and hand
+                // the raw progressive stream to the embedder for CPU decode (the
+                // codec is stateful per surface, so it must live on their side).
+                let (origin_x, origin_y, width, height) = match self.surfaces.get(&pdu.surface_id) {
+                    Some(s) => (s.output_origin_x, s.output_origin_y, s.width, s.height),
+                    None => (0, 0, 0, 0),
+                };
+                trace!(
+                    surface_id = pdu.surface_id,
+                    codec_context_id = pdu.codec_context_id,
+                    data_len = pdu.bitmap_data.len(),
+                    "WireToSurface2 (RFX-Progressive)"
+                );
+                self.handler
+                    .on_progressive_data(pdu.surface_id, origin_x, origin_y, width, height, &pdu.bitmap_data);
+                // Keep the legacy hook for any embedder still using it.
                 self.handler.on_wire_to_surface2(&pdu);
                 Ok(vec![])
             }
@@ -736,6 +773,9 @@ impl GraphicsPipelineClient {
             Codec1Type::Uncompressed => {
                 self.handle_uncompressed(pdu);
             }
+            Codec1Type::Planar => {
+                self.decode_planar(pdu);
+            }
             _ => {
                 trace!(codec_id = ?pdu.codec_id, "Forwarding unsupported codec to handler");
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
@@ -825,6 +865,41 @@ impl GraphicsPipelineClient {
             height: dest_height,
         };
 
+        self.handler.on_bitmap_updated(&update);
+    }
+
+    /// Decode an RDP 6.0 Planar-coded tile (MS-RDPEGDI 2.2.2.5.1) and deliver it
+    /// as an RGBA [`BitmapUpdate`]. This is the codec xrdp's GFX module uses for
+    /// desktop tiles (WireToSurface1, `codecId = Planar`).
+    fn decode_planar(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
+        let dest_width = pdu.destination_rectangle.width();
+        let dest_height = pdu.destination_rectangle.height();
+
+        let mut rgb24 = Vec::new();
+        if let Err(e) = self.planar_decoder.decode_bitmap_stream_to_rgb24(
+            &pdu.bitmap_data,
+            &mut rgb24,
+            usize::from(dest_width),
+            usize::from(dest_height),
+        ) {
+            warn!(error = %e, surface_id = pdu.surface_id, "Planar decode failed");
+            return;
+        }
+
+        // Expand RGB24 → RGBA8888 (the uniform BitmapUpdate.data convention).
+        let mut rgba = Vec::with_capacity(rgb24.len() / 3 * 4);
+        for px in rgb24.chunks_exact(3) {
+            rgba.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+        }
+
+        let update = BitmapUpdate {
+            surface_id: pdu.surface_id,
+            destination_rectangle: pdu.destination_rectangle,
+            codec_id: Codec1Type::Planar,
+            data: rgba,
+            width: dest_width,
+            height: dest_height,
+        };
         self.handler.on_bitmap_updated(&update);
     }
 
