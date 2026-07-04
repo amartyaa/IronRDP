@@ -10,7 +10,7 @@ use ironrdp_pdu::{self as pdu, decode_err, encode_err, pdu_other_err};
 use ironrdp_svc::{ChannelFlags, CompressionCondition, SvcClientProcessor, SvcMessage, SvcProcessor};
 use pdu::PduResult;
 use pdu::gcc::ChannelName;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::pdu::{
     CapabilitiesResponsePdu, CapsVersion, ClosePdu, CreateResponsePdu, CreationStatus, DrdynvcClientPdu,
@@ -210,8 +210,14 @@ impl SvcProcessor for DrdynvcClient {
 
                 let (creation_status, start_messages) =
                     if let Some(dvc) = self.dynamic_channels.try_create_channel(&channel_name, channel_id) {
+                        info!("DVC channel created: {channel_name} (id {channel_id})");
                         (CreationStatus::OK, dvc.start()?)
                     } else {
+                        // Info-level on purpose: a server asking for a channel we
+                        // don't handle is the key diagnostic for missing features
+                        // (e.g. audio silently absent because the server only
+                        // speaks a DVC transport the client doesn't register).
+                        info!("DVC create request for unhandled channel: {channel_name} (id {channel_id})");
                         (CreationStatus::NO_LISTENER, Vec::new())
                     };
 

@@ -46,6 +46,7 @@ impl ActiveStage {
             connection_result.io_channel_id,
             connection_result.share_id,
             connection_result.connection_activation,
+            connection_result.message_channel_id,
         );
 
         // Create bulk decompressor if compression was negotiated
@@ -380,6 +381,12 @@ pub enum ActiveStageOutput {
     ///
     /// [\[MS-RDPBCGR\] 2.2.14.1.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/228ffc5c-b60c-4d3e-9781-ac613f822fdf
     AutoDetect(AutoDetectRequest),
+    /// Deferred/late Server Redirection PDU ([\[MS-RDPBCGR\] 2.2.13.2.1]),
+    /// arriving mid-session. The application should reconnect using the
+    /// routing token / credentials carried in the packet.
+    ///
+    /// [\[MS-RDPBCGR\] 2.2.13.2.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/df3d59e6-30a8-4a36-bd2d-9d11bcd96c3e
+    Redirect(Box<ironrdp_pdu::rdp::headers::RdpServerRedirectionPacket>),
 }
 
 impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
@@ -403,6 +410,7 @@ impl TryFrom<x224::ProcessorOutput> for ActiveStageOutput {
             x224::ProcessorOutput::DeactivateAll(cas) => Ok(Self::DeactivateAll(cas)),
             x224::ProcessorOutput::MultitransportRequest(pdu) => Ok(Self::MultitransportRequest(pdu)),
             x224::ProcessorOutput::AutoDetect(request) => Ok(Self::AutoDetect(request)),
+            x224::ProcessorOutput::Redirect(packet) => Ok(Self::Redirect(packet)),
             // GraphicsUpdate and PointerUpdate are consumed in ActiveStage::process()
             // before reaching this conversion.
             x224::ProcessorOutput::GraphicsUpdate(_) | x224::ProcessorOutput::PointerUpdate(_) => Err(

@@ -47,6 +47,12 @@ pub enum ProcessorOutput {
     /// Slow-path pointer update ([MS-RDPBCGR] 2.2.9.1.1.4).
     /// Raw pointer payload starting with `messageType(u16) + pad(u16)`.
     PointerUpdate(Vec<u8>),
+    /// Deferred/late Server Redirection PDU ([MS-RDPBCGR] 2.2.13.2.1), arriving
+    /// mid-session. The application should reconnect using the routing token /
+    /// credentials carried in the packet (see [`RdpServerRedirectionPacket`]).
+    ///
+    /// [`RdpServerRedirectionPacket`]: ironrdp_pdu::rdp::headers::RdpServerRedirectionPacket
+    Redirect(Box<ironrdp_pdu::rdp::headers::RdpServerRedirectionPacket>),
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +73,13 @@ pub struct Processor {
     io_channel_id: u16,
     share_id: u32,
     connection_activation: ConnectionActivationSequence,
+    /// MCS message channel id (SC_MCS_MSGCHANNEL), when granted. Carries
+    /// server-driven continuous network detection (MS-RDPBCGR 2.2.14) —
+    /// e.g. GNOME Remote Desktop pings RTT on it every 70–700 ms and paces
+    /// audio/graphics on the answers.
+    message_channel_id: Option<u16>,
+    autodetect: ironrdp_pdu::rdp::autodetect::NetworkDetectionResponder,
+    started_at: web_time::Instant,
 }
 
 impl Processor {
@@ -76,6 +89,7 @@ impl Processor {
         io_channel_id: u16,
         share_id: u32,
         connection_activation: ConnectionActivationSequence,
+        message_channel_id: Option<u16>,
     ) -> Self {
         Self {
             static_channels,
@@ -83,6 +97,9 @@ impl Processor {
             io_channel_id,
             share_id,
             connection_activation,
+            message_channel_id,
+            autodetect: ironrdp_pdu::rdp::autodetect::NetworkDetectionResponder::new(),
+            started_at: web_time::Instant::now(),
         }
     }
 
@@ -134,6 +151,8 @@ impl Processor {
 
         if channel_id == self.io_channel_id {
             self.process_io_channel(data_ctx)
+        } else if Some(channel_id) == self.message_channel_id {
+            self.process_message_channel(data_ctx)
         } else if let Some(svc) = self.static_channels.get_by_channel_id_mut(channel_id) {
             let response_pdus = svc.process(data_ctx.user_data).map_err(SessionError::pdu)?;
             process_svc_messages(response_pdus, channel_id, data_ctx.initiator_id)
@@ -141,6 +160,53 @@ impl Processor {
         } else {
             Err(reason_err!("X224", "unexpected channel received: ID {channel_id}"))
         }
+    }
+
+    /// Handles continuous network detection on the MCS message channel:
+    /// answers RTT/bandwidth measurements, surfaces
+    /// [`AutoDetectRequest::NetworkCharacteristicsResult`] to the caller.
+    fn process_message_channel(&mut self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
+        use ironrdp_core::Decode as _;
+        use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+
+        let mut cursor = ironrdp_core::ReadCursor::new(data_ctx.user_data);
+        let header = BasicSecurityHeader::decode(&mut cursor).map_err(SessionError::decode)?;
+        if !header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_REQ) {
+            // E.g. multitransport bootstrapping — we never advertise UDP
+            // transports, so nothing to answer.
+            debug!(?header.flags, "Ignoring non-autodetect message channel PDU");
+            return Ok(Vec::new());
+        }
+
+        let request = AutoDetectRequest::decode(&mut cursor).map_err(SessionError::decode)?;
+
+        let mut outputs = Vec::new();
+
+        let now_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(response) = self.autodetect.handle_request(&request, now_ms) {
+            let wrapped = SecurityHeaderWrapped {
+                header: BasicSecurityHeader {
+                    flags: BasicSecurityHeaderFlags::AUTODETECT_RSP,
+                },
+                inner: &response,
+            };
+            let mut buf = WriteBuf::new();
+            ironrdp_connector::legacy::encode_send_data_request(
+                self.user_channel_id,
+                data_ctx.channel_id,
+                &wrapped,
+                &mut buf,
+            )
+            .map_err(crate::legacy::map_error)?;
+            outputs.push(ProcessorOutput::ResponseFrame(buf.into_inner()));
+        }
+
+        if let AutoDetectRequest::NetworkCharacteristicsResult { .. } = request {
+            debug!(?request, "Network characteristics result received");
+            outputs.push(ProcessorOutput::AutoDetect(request));
+        }
+
+        Ok(outputs)
     }
 
     fn process_io_channel(&self, data_ctx: SendDataIndicationCtx<'_>) -> SessionResult<Vec<ProcessorOutput>> {
@@ -246,6 +312,10 @@ impl Processor {
             ironrdp_connector::legacy::IoChannelPdu::DeactivateAll(_) => Ok(vec![ProcessorOutput::DeactivateAll(
                 Box::new(self.connection_activation.reset_clone()),
             )]),
+            ironrdp_connector::legacy::IoChannelPdu::Redirect(packet) => {
+                debug!("Received Server Redirection PDU");
+                Ok(vec![ProcessorOutput::Redirect(Box::new(packet))])
+            }
         }
     }
 
@@ -271,4 +341,26 @@ impl Processor {
 /// The caller is responsible for ensuring that the `channel_id` corresponds to the correct channel.
 fn process_svc_messages(messages: Vec<SvcMessage>, channel_id: u16, initiator_id: u16) -> SessionResult<Vec<u8>> {
     client_encode_svc_messages(messages, channel_id, initiator_id).map_err(SessionError::encode)
+}
+
+/// A payload prefixed with a Basic Security Header — the framing used by
+/// message-channel PDUs such as autodetect responses (MS-RDPBCGR 2.2.14.2).
+struct SecurityHeaderWrapped<'a, T> {
+    header: ironrdp_pdu::rdp::headers::BasicSecurityHeader,
+    inner: &'a T,
+}
+
+impl<T: ironrdp_core::Encode> ironrdp_core::Encode for SecurityHeaderWrapped<'_, T> {
+    fn encode(&self, dst: &mut ironrdp_core::WriteCursor<'_>) -> ironrdp_core::EncodeResult<()> {
+        self.header.encode(dst)?;
+        self.inner.encode(dst)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn size(&self) -> usize {
+        self.header.size() + self.inner.size()
+    }
 }

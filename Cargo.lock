@@ -2368,6 +2368,7 @@ dependencies = [
  "ironrdp-displaycontrol",
  "ironrdp-dvc",
  "ironrdp-echo",
+ "ironrdp-egfx",
  "ironrdp-graphics",
  "ironrdp-input",
  "ironrdp-pdu",
@@ -2541,6 +2542,7 @@ dependencies = [
  "sspi",
  "tracing",
  "url",
+ "web-time",
 ]
 
 [[package]]
@@ -2779,6 +2781,7 @@ version = "0.7.0"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
+ "ironrdp-dvc",
  "ironrdp-pdu",
  "ironrdp-svc",
  "tracing",
@@ -2844,6 +2847,7 @@ dependencies = [
  "ironrdp-svc",
  "qoicoubeh",
  "tracing",
+ "web-time",
  "zstd-safe",
 ]
 

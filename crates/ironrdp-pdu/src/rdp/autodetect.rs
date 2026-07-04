@@ -676,6 +676,76 @@ impl<'de> Decode<'de> for AutoDetectResponse {
     }
 }
 
+/// Stateful responder for server-driven network detection (MS-RDPBCGR 2.2.14):
+/// answers RTT measure requests, accumulates bandwidth-measure payload bytes
+/// between Start and Stop, and reports the measured results. Used for both
+/// connect-time (connector) and continuous (active session) detection — the
+/// PDUs are identical, only the transport state differs.
+///
+/// Transport- and clock-agnostic: the caller supplies a monotonic `now_ms`
+/// timestamp with each request.
+#[derive(Debug, Default)]
+pub struct NetworkDetectionResponder {
+    bw_start_ms: Option<u64>,
+    bw_connect_time: bool,
+    bw_byte_count: u32,
+}
+
+impl NetworkDetectionResponder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Handles one server request; returns the response to send back on the
+    /// same channel, if any. `NetworkCharacteristicsResult` yields no wire
+    /// response (the client-side Sync PDU is only for replaying *cached*
+    /// results on reconnect) — callers may still surface its contents.
+    pub fn handle_request(&mut self, request: &AutoDetectRequest, now_ms: u64) -> Option<AutoDetectResponse> {
+        match request {
+            AutoDetectRequest::RttRequest { sequence_number, .. } => Some(AutoDetectResponse::RttResponse {
+                sequence_number: *sequence_number,
+            }),
+            AutoDetectRequest::BandwidthMeasureStart { request_type, .. } => {
+                self.bw_start_ms = Some(now_ms);
+                self.bw_connect_time = *request_type == BW_START_CONNECT_TIME;
+                self.bw_byte_count = 0;
+                None
+            }
+            AutoDetectRequest::BandwidthMeasurePayload { payload, .. } => {
+                self.bw_byte_count = self
+                    .bw_byte_count
+                    .saturating_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
+                None
+            }
+            AutoDetectRequest::BandwidthMeasureStop {
+                sequence_number,
+                payload,
+                ..
+            } => {
+                // A Stop without a Start is ignored rather than answered with
+                // garbage measurements.
+                let start_ms = self.bw_start_ms.take()?;
+                if let Some(payload) = payload {
+                    self.bw_byte_count = self
+                        .bw_byte_count
+                        .saturating_add(u32::try_from(payload.len()).unwrap_or(u32::MAX));
+                }
+                Some(AutoDetectResponse::BandwidthMeasureResults {
+                    sequence_number: *sequence_number,
+                    response_type: if self.bw_connect_time {
+                        BW_RESULTS_CONNECT_TIME
+                    } else {
+                        BW_RESULTS_CONTINUOUS
+                    },
+                    time_delta_ms: u32::try_from(now_ms.saturating_sub(start_ms)).unwrap_or(u32::MAX),
+                    byte_count: self.bw_byte_count,
+                })
+            }
+            AutoDetectRequest::NetworkCharacteristicsResult { .. } => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,5 +1150,77 @@ mod tests {
 
         let rsp = AutoDetectResponse::RttResponse { sequence_number: 99 };
         assert_eq!(rsp.sequence_number(), 99);
+    }
+
+    #[test]
+    fn responder_bandwidth_measure_round() {
+        let mut responder = NetworkDetectionResponder::new();
+
+        assert!(
+            responder
+                .handle_request(
+                    &AutoDetectRequest::BandwidthMeasureStart {
+                        sequence_number: 1,
+                        request_type: BW_START_CONNECT_TIME,
+                    },
+                    1_000,
+                )
+                .is_none()
+        );
+        assert!(
+            responder
+                .handle_request(
+                    &AutoDetectRequest::BandwidthMeasurePayload {
+                        sequence_number: 2,
+                        payload: vec![0; 1024],
+                    },
+                    1_050,
+                )
+                .is_none()
+        );
+        let result = responder
+            .handle_request(
+                &AutoDetectRequest::BandwidthMeasureStop {
+                    sequence_number: 3,
+                    request_type: BW_STOP_CONNECT_TIME,
+                    payload: Some(vec![0; 512]),
+                },
+                1_250,
+            )
+            .expect("stop yields results");
+        assert_eq!(
+            result,
+            AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: 3,
+                response_type: BW_RESULTS_CONNECT_TIME,
+                time_delta_ms: 250,
+                byte_count: 1536,
+            }
+        );
+
+        // RTT requests answered directly; stop without start ignored.
+        assert!(
+            responder
+                .handle_request(
+                    &AutoDetectRequest::RttRequest {
+                        sequence_number: 7,
+                        request_type: RTT_REQUEST_CONTINUOUS,
+                    },
+                    2_000,
+                )
+                .is_some()
+        );
+        assert!(
+            responder
+                .handle_request(
+                    &AutoDetectRequest::BandwidthMeasureStop {
+                        sequence_number: 8,
+                        request_type: BW_STOP_CONNECT_TIME,
+                        payload: None,
+                    },
+                    2_000,
+                )
+                .is_none()
+        );
     }
 }

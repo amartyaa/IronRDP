@@ -2,7 +2,9 @@ use std::borrow::Cow;
 
 use ironrdp_core::{Decode, Encode, WriteBuf, decode, encode_vec};
 use ironrdp_pdu::rdp;
-use ironrdp_pdu::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeaderFlags, ServerDeactivateAll};
+use ironrdp_pdu::rdp::headers::{
+    BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeaderFlags, RdpServerRedirectionPacket, ServerDeactivateAll,
+};
 use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
 use ironrdp_pdu::x224::X224;
 
@@ -172,6 +174,11 @@ pub enum IoChannelPdu {
     ///
     /// Received when the server wants the client to establish a sideband UDP transport.
     MultitransportRequest(MultitransportRequestPdu),
+    /// Server Redirection PDU (deferred/late redirection, arriving mid-session).
+    ///
+    /// Sent by e.g. GNOME Remote Desktop's headless "Remote Login" mode to hand
+    /// off from its greeter-level daemon to a per-user session daemon.
+    Redirect(RdpServerRedirectionPacket),
 }
 
 pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoChannelPdu> {
@@ -201,6 +208,7 @@ pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoCh
         rdp::headers::ShareControlPdu::ServerDeactivateAll(deactivate_all) => {
             Ok(IoChannelPdu::DeactivateAll(deactivate_all))
         }
+        rdp::headers::ShareControlPdu::ServerRedirect(packet) => Ok(IoChannelPdu::Redirect(packet)),
         rdp::headers::ShareControlPdu::Data(share_data_header) => {
             let share_data_ctx = ShareDataCtx {
                 initiator_id: ctx.initiator_id,

@@ -121,7 +121,6 @@ impl<'de> Decode<'de> for ShareControlHeader {
         let total_length = usize::from(src.read_u16());
         let pdu_type_with_version = src.read_u16();
         let pdu_source = src.read_u16();
-        let share_id = src.read_u32();
 
         let pdu_type = ShareControlPduType::from_u16(pdu_type_with_version & SHARE_CONTROL_HEADER_MASK)
             .ok_or_else(|| invalid_field_err!("pdu_type", "invalid pdu type"))?;
@@ -129,6 +128,19 @@ impl<'de> Decode<'de> for ShareControlHeader {
         if pdu_version != PROTOCOL_VERSION {
             return Err(invalid_field_err!("pdu_version", "invalid PDU version"));
         }
+
+        // The Enhanced Security Server Redirection PDU (MS-RDPBCGR 2.2.13.3)
+        // has NO shareId — the share control header is followed by pad2Octets
+        // and then the redirection packet itself (which begins with its own
+        // 0x0400 marker). Every other share control PDU carries a shareId here.
+        let share_id = if pdu_type == ShareControlPduType::ServerRedirect {
+            ensure_size!(in: src, size: 2);
+            read_padding!(src, 2);
+            0
+        } else {
+            ensure_size!(in: src, size: 4);
+            src.read_u32()
+        };
 
         let share_pdu = ShareControlPdu::from_type(src, pdu_type)?;
         let header = Self {
@@ -165,6 +177,7 @@ pub enum ShareControlPdu {
     ClientConfirmActive(ClientConfirmActive),
     Data(ShareDataHeader),
     ServerDeactivateAll(ServerDeactivateAll),
+    ServerRedirect(RdpServerRedirectionPacket),
 }
 
 impl ShareControlPdu {
@@ -176,6 +189,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => "Client Confirm Active PDU",
             ShareControlPdu::Data(_) => "Data PDU",
             ShareControlPdu::ServerDeactivateAll(_) => "Server Deactivate All PDU",
+            ShareControlPdu::ServerRedirect(_) => "Server Redirection PDU",
         }
     }
 
@@ -185,6 +199,7 @@ impl ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(_) => ShareControlPduType::ConfirmActivePdu,
             ShareControlPdu::Data(_) => ShareControlPduType::DataPdu,
             ShareControlPdu::ServerDeactivateAll(_) => ShareControlPduType::DeactivateAllPdu,
+            ShareControlPdu::ServerRedirect(_) => ShareControlPduType::ServerRedirect,
         }
     }
 
@@ -200,7 +215,9 @@ impl ShareControlPdu {
             ShareControlPduType::DeactivateAllPdu => {
                 Ok(ShareControlPdu::ServerDeactivateAll(ServerDeactivateAll::decode(src)?))
             }
-            _ => Err(invalid_field_err!("share_type", "unexpected share control PDU type")),
+            ShareControlPduType::ServerRedirect => {
+                Ok(ShareControlPdu::ServerRedirect(RdpServerRedirectionPacket::decode(src)?))
+            }
         }
     }
 }
@@ -212,6 +229,7 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.encode(dst),
             ShareControlPdu::Data(share_data_header) => share_data_header.encode(dst),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.encode(dst),
+            ShareControlPdu::ServerRedirect(packet) => packet.encode(dst),
         }
     }
 
@@ -225,6 +243,7 @@ impl Encode for ShareControlPdu {
             ShareControlPdu::ClientConfirmActive(pdu) => pdu.size(),
             ShareControlPdu::Data(share_data_header) => share_data_header.size(),
             ShareControlPdu::ServerDeactivateAll(deactivate_all) => deactivate_all.size(),
+            ShareControlPdu::ServerRedirect(packet) => packet.size(),
         }
     }
 }
@@ -678,5 +697,269 @@ impl Encode for ServerDeactivateAll {
 
     fn size(&self) -> usize {
         Self::FIXED_PART_SIZE
+    }
+}
+
+bitflags! {
+    /// RedirFlags bit field of the [`RdpServerRedirectionPacket`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+    pub struct RedirectionFlags: u32 {
+        const LB_TARGET_NET_ADDRESS = 0x0000_0001;
+        const LB_LOAD_BALANCE_INFO = 0x0000_0002;
+        const LB_USERNAME = 0x0000_0004;
+        const LB_DOMAIN = 0x0000_0008;
+        const LB_PASSWORD = 0x0000_0010;
+        const LB_DONTSTOREUSERNAME = 0x0000_0020;
+        const LB_SMARTCARD_LOGON = 0x0000_0040;
+        const LB_NOREDIRECT = 0x0000_0080;
+        const LB_TARGET_FQDN = 0x0000_0100;
+        const LB_TARGET_NETBIOS_NAME = 0x0000_0200;
+        const LB_TARGET_NET_ADDRESSES = 0x0000_0800;
+        const LB_CLIENT_TSV_URL = 0x0000_1000;
+        const LB_SERVER_TSV_CAPABLE = 0x0000_2000;
+        const LB_PASSWORD_IS_PK_ENCRYPTED = 0x0000_4000;
+        const LB_REDIRECTION_GUID = 0x0000_8000;
+        const LB_TARGET_CERTIFICATE = 0x0001_0000;
+
+        const _ = !0;
+    }
+}
+
+const SEC_REDIRECTION_PKT_MARKER: u16 = 0x0400;
+
+/// 2.2.13.2.1 Server Redirection Packet (RDP_SERVER_REDIRECTION_PACKET)
+///
+/// Sent (wrapped in a Share Control Header, `pduType` = `ServerRedirect`) either
+/// during the connection sequence or, as here, deferred until after the client
+/// is already active — e.g. GNOME Remote Desktop's headless "Remote Login" mode
+/// hands off from its greeter-level daemon to a per-user session this way. Every
+/// optional field below is opaque to the client: it is not parsed further, only
+/// forwarded verbatim (routing token on the X.224 reconnect, and username/domain/
+/// password/redirection GUID into the RDSTLS Authentication Request PDU).
+///
+/// [2.2.13.2.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/df3d59e6-30a8-4a36-bd2d-9d11bcd96c3e
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct RdpServerRedirectionPacket {
+    pub session_id: u32,
+    pub flags: RedirectionFlags,
+    pub target_net_address: Option<Vec<u8>>,
+    /// Opaque routing token. When `LB_TARGET_NET_ADDRESS` is not set, this MUST
+    /// be sent as the X.224 routing token (see `nego::NegoRequestData::RoutingToken`)
+    /// on reconnect.
+    pub load_balance_info: Option<Vec<u8>>,
+    /// UTF-16LE, null-terminated, exactly as it appeared on the wire.
+    pub user_name: Option<Vec<u8>>,
+    pub domain: Option<Vec<u8>>,
+    /// If `flags` contains `LB_PASSWORD_IS_PK_ENCRYPTED`, this is an opaque blob
+    /// pre-encrypted by the server for RDSTLS and MUST NOT be decrypted or
+    /// modified by the client.
+    pub password: Option<Vec<u8>>,
+    pub target_fqdn: Option<Vec<u8>>,
+    pub target_netbios_name: Option<Vec<u8>>,
+    pub tsv_url: Option<Vec<u8>>,
+    /// Base64-encoded GUID (UTF-16), forwarded verbatim into RDSTLS.
+    pub redirection_guid: Option<Vec<u8>>,
+    /// Base64-encoded Target Certificate Container (UTF-16). The TLS certificate
+    /// presented on reconnect SHOULD match this.
+    pub target_certificate: Option<Vec<u8>>,
+    pub target_net_addresses: Option<Vec<u8>>,
+}
+
+impl RdpServerRedirectionPacket {
+    const FIXED_PART_SIZE: usize = 2 /* Flags */ + 2 /* Length */ + 4 /* SessionID */ + 4 /* RedirFlags */;
+
+    fn optional_fields_size(&self) -> usize {
+        [
+            &self.target_net_address,
+            &self.load_balance_info,
+            &self.user_name,
+            &self.domain,
+            &self.password,
+            &self.target_fqdn,
+            &self.target_netbios_name,
+            &self.tsv_url,
+            &self.redirection_guid,
+            &self.target_certificate,
+            &self.target_net_addresses,
+        ]
+        .into_iter()
+        .filter_map(|field| field.as_ref())
+        .map(|field| 4 /* length prefix */ + field.len())
+        .sum()
+    }
+}
+
+fn read_length_prefixed_field(src: &mut ReadCursor<'_>) -> DecodeResult<Vec<u8>> {
+    ensure_size!(in: src, size: 4);
+    let len = cast_length!("fieldLength", src.read_u32())?;
+    ensure_size!(in: src, size: len);
+    Ok(src.read_slice(len).to_vec())
+}
+
+fn write_length_prefixed_field(dst: &mut WriteCursor<'_>, field: &[u8]) -> EncodeResult<()> {
+    dst.write_u32(cast_length!("fieldLength", field.len())?);
+    dst.write_slice(field);
+    Ok(())
+}
+
+impl Decode<'_> for RdpServerRedirectionPacket {
+    fn decode(src: &mut ReadCursor<'_>) -> DecodeResult<Self> {
+        ensure_size!(in: src, size: Self::FIXED_PART_SIZE);
+
+        let marker = src.read_u16();
+        if marker != SEC_REDIRECTION_PKT_MARKER {
+            return Err(invalid_field_err!("flags", "expected SEC_REDIRECTION_PKT (0x0400)"));
+        }
+        let _length = src.read_u16();
+        let session_id = src.read_u32();
+        let flags = RedirectionFlags::from_bits_retain(src.read_u32());
+
+        let target_net_address = flags
+            .contains(RedirectionFlags::LB_TARGET_NET_ADDRESS)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let load_balance_info = flags
+            .contains(RedirectionFlags::LB_LOAD_BALANCE_INFO)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let user_name = flags
+            .contains(RedirectionFlags::LB_USERNAME)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let domain = flags
+            .contains(RedirectionFlags::LB_DOMAIN)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let password = flags
+            .contains(RedirectionFlags::LB_PASSWORD)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let target_fqdn = flags
+            .contains(RedirectionFlags::LB_TARGET_FQDN)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let target_netbios_name = flags
+            .contains(RedirectionFlags::LB_TARGET_NETBIOS_NAME)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let tsv_url = flags
+            .contains(RedirectionFlags::LB_CLIENT_TSV_URL)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let redirection_guid = flags
+            .contains(RedirectionFlags::LB_REDIRECTION_GUID)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let target_certificate = flags
+            .contains(RedirectionFlags::LB_TARGET_CERTIFICATE)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        let target_net_addresses = flags
+            .contains(RedirectionFlags::LB_TARGET_NET_ADDRESSES)
+            .then(|| read_length_prefixed_field(src))
+            .transpose()?;
+        // Any remaining bytes are the optional 8-byte Pad field ("MUST be
+        // ignored" per spec) — nothing left to read.
+
+        Ok(Self {
+            session_id,
+            flags,
+            target_net_address,
+            load_balance_info,
+            user_name,
+            domain,
+            password,
+            target_fqdn,
+            target_netbios_name,
+            tsv_url,
+            redirection_guid,
+            target_certificate,
+            target_net_addresses,
+        })
+    }
+}
+
+impl Encode for RdpServerRedirectionPacket {
+    fn encode(&self, dst: &mut WriteCursor<'_>) -> EncodeResult<()> {
+        ensure_size!(in: dst, size: self.size());
+
+        dst.write_u16(SEC_REDIRECTION_PKT_MARKER);
+        dst.write_u16(cast_length!("length", self.size())?);
+        dst.write_u32(self.session_id);
+        dst.write_u32(self.flags.bits());
+
+        for field in [
+            &self.target_net_address,
+            &self.load_balance_info,
+            &self.user_name,
+            &self.domain,
+            &self.password,
+            &self.target_fqdn,
+            &self.target_netbios_name,
+            &self.tsv_url,
+            &self.redirection_guid,
+            &self.target_certificate,
+            &self.target_net_addresses,
+        ] {
+            if let Some(field) = field {
+                write_length_prefixed_field(dst, field)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "Server Redirection Packet"
+    }
+
+    fn size(&self) -> usize {
+        Self::FIXED_PART_SIZE + self.optional_fields_size()
+    }
+}
+
+#[cfg(test)]
+mod server_redirection_tests {
+    use super::*;
+
+    /// Decodes a gnome-remote-desktop-style deferred Server Redirection PDU:
+    /// share control header (6 bytes, no shareId!) + pad2Octets + packet.
+    /// Guards the offset bug where shareId was read unconditionally, eating
+    /// pad2Octets + the packet's 0x0400 marker.
+    #[test]
+    fn decodes_share_control_wrapped_server_redirection() {
+        let cookie = b"Cookie: msts=1611166392\r\n";
+        let user: Vec<u8> = "u\0".encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
+
+        let mut body = Vec::new();
+        body.extend(0x0400u16.to_le_bytes()); // Flags: SEC_REDIRECTION_PKT
+        let flags = RedirectionFlags::LB_LOAD_BALANCE_INFO | RedirectionFlags::LB_USERNAME;
+        let length = 12 + 4 + cookie.len() + 4 + user.len();
+        body.extend((u16::try_from(length).unwrap()).to_le_bytes());
+        body.extend(0u32.to_le_bytes()); // SessionID
+        body.extend(flags.bits().to_le_bytes());
+        body.extend((u32::try_from(cookie.len()).unwrap()).to_le_bytes());
+        body.extend_from_slice(cookie);
+        body.extend((u32::try_from(user.len()).unwrap()).to_le_bytes());
+        body.extend_from_slice(&user);
+
+        let mut wire = Vec::new();
+        wire.extend((u16::try_from(6 + 2 + body.len()).unwrap()).to_le_bytes()); // totalLength
+        wire.extend((PROTOCOL_VERSION | ShareControlPduType::ServerRedirect.as_u16()).to_le_bytes());
+        wire.extend(0u16.to_le_bytes()); // pduSource
+        wire.extend(0u16.to_le_bytes()); // pad2Octets — NOT a shareId
+        wire.extend_from_slice(&body);
+
+        let mut cursor = ReadCursor::new(&wire);
+        let header = ShareControlHeader::decode(&mut cursor).expect("decode");
+        let ShareControlPdu::ServerRedirect(packet) = header.share_control_pdu else {
+            panic!("expected ServerRedirect, got {}", header.share_control_pdu.as_short_name());
+        };
+        assert_eq!(packet.flags, flags);
+        assert_eq!(packet.load_balance_info.as_deref(), Some(cookie.as_slice()));
+        assert_eq!(packet.user_name.as_deref(), Some(user.as_slice()));
+        assert_eq!(packet.password, None);
     }
 }

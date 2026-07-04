@@ -29,6 +29,12 @@ pub struct ConnectionResult {
     pub connection_activation: ConnectionActivationSequence,
     /// The bulk compression type that was negotiated, if any.
     pub compression_type: Option<rdp::client_info::CompressionType>,
+    /// MCS message channel id (SC_MCS_MSGCHANNEL), when granted by the server.
+    /// Carries server-driven network detection (MS-RDPBCGR 2.2.14) during the
+    /// active session; the session layer must answer those requests or
+    /// servers that pace on RTT (e.g. GNOME Remote Desktop) degrade or
+    /// disable features gated on it (audio redirection).
+    pub message_channel_id: Option<u16>,
 }
 
 #[derive(Default, Debug)]
@@ -126,6 +132,15 @@ pub struct ClientConnector {
     /// The client address to be used in the Client Info PDU.
     pub client_addr: SocketAddr,
     pub static_channels: StaticChannelSet,
+    /// MCS message channel id (SC_MCS_MSGCHANNEL), once granted by the server.
+    message_channel_id: Option<u16>,
+    /// MCS user channel id, once assigned (needed as initiator for
+    /// message-channel responses sent during the connection sequence).
+    user_channel_id: Option<u16>,
+    /// Responder for server-driven connect-time network detection.
+    autodetect: rdp::autodetect::NetworkDetectionResponder,
+    /// Monotonic clock base for bandwidth-measure timing.
+    started_at: web_time::Instant,
 }
 
 impl ClientConnector {
@@ -135,7 +150,60 @@ impl ClientConnector {
             state: ClientConnectorState::ConnectionInitiationSendRequest,
             client_addr,
             static_channels: StaticChannelSet::new(),
+            message_channel_id: None,
+            user_channel_id: None,
+            autodetect: rdp::autodetect::NetworkDetectionResponder::new(),
+            started_at: web_time::Instant::now(),
         }
+    }
+
+    /// Handles PDUs arriving on the MCS message channel (network detection,
+    /// multitransport bootstrapping) which may interleave with any post-MCS
+    /// state of the connection sequence. Returns `Some(written)` when the
+    /// input was a message-channel PDU (now fully handled), `None` when the
+    /// input belongs to the regular sequence.
+    fn try_process_message_channel(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Option<Written>> {
+        use ironrdp_core::Decode as _;
+        use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
+        use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+
+        let (Some(message_channel_id), Some(user_channel_id)) = (self.message_channel_id, self.user_channel_id) else {
+            return Ok(None);
+        };
+        let Ok(X224(mcs::McsMessage::SendDataIndication(indication))) = decode::<X224<mcs::McsMessage<'_>>>(input)
+        else {
+            return Ok(None);
+        };
+        if indication.channel_id != message_channel_id {
+            return Ok(None);
+        }
+
+        let mut cursor = ironrdp_core::ReadCursor::new(indication.user_data.as_ref());
+        let header = BasicSecurityHeader::decode(&mut cursor).map_err(ConnectorError::decode)?;
+        if !header.flags.contains(BasicSecurityHeaderFlags::AUTODETECT_REQ) {
+            // E.g. multitransport bootstrapping — consume silently; we never
+            // advertise UDP transports, so no response is expected.
+            debug!(?header.flags, "Ignoring non-autodetect message channel PDU");
+            return Ok(Some(Written::Nothing));
+        }
+
+        let request = AutoDetectRequest::decode(&mut cursor).map_err(ConnectorError::decode)?;
+        debug!(?request, "Received connect-time autodetect request");
+
+        let now_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let Some(response) = self.autodetect.handle_request(&request, now_ms) else {
+            return Ok(Some(Written::Nothing));
+        };
+
+        debug!(?response, "Sending connect-time autodetect response");
+        let message = SecurityHeaderWrapped {
+            header: BasicSecurityHeader {
+                flags: BasicSecurityHeaderFlags::AUTODETECT_RSP,
+            },
+            inner: &response,
+        };
+        let written = encode_send_data_request(user_channel_id, message_channel_id, &message, output)?;
+        Ok(Some(Written::from_size(written)?))
     }
 
     #[must_use]
@@ -230,6 +298,16 @@ impl Sequence for ClientConnector {
     }
 
     fn step(&mut self, input: &[u8], output: &mut WriteBuf) -> ConnectorResult<Written> {
+        // Server-driven network detection (MS-RDPBCGR 2.2.14) rides the MCS
+        // message channel and may interleave with any post-MCS state of the
+        // connection sequence (licensing, capabilities, finalization).
+        // Intercept it here so the per-state logic below never sees it.
+        if !input.is_empty() {
+            if let Some(written) = self.try_process_message_channel(input, output)? {
+                return Ok(written);
+            }
+        }
+
         let (written, next_state) = match mem::take(&mut self.state) {
             // Invalid state
             ClientConnectorState::Consumed => {
@@ -382,8 +460,12 @@ impl Sequence for ClientConnector {
                     return Err(general_err!("can't satisfy server security settings"));
                 }
 
-                if server_gcc_blocks.message_channel.is_some() {
-                    warn!("Unexpected ServerMessageChannelData GCC block (not supported)");
+                self.message_channel_id = server_gcc_blocks
+                    .message_channel
+                    .as_ref()
+                    .map(|mc| mc.mcs_message_channel_id);
+                if let Some(id) = self.message_channel_id {
+                    debug!(message_channel_id = id, "Server granted MCS message channel");
                 }
 
                 if server_gcc_blocks.multi_transport_channel.is_some() {
@@ -411,6 +493,11 @@ impl Sequence for ClientConnector {
                     .early_capability_flags
                     .is_some_and(|c| c.contains(gcc::ServerEarlyCapabilityFlags::SKIP_CHANNELJOIN_SUPPORTED));
 
+                // The message channel must be MCS-joined like any other
+                // channel; the server pushes autodetect requests on it.
+                let mut channel_ids_to_join = static_channel_ids;
+                channel_ids_to_join.extend(self.message_channel_id);
+
                 (
                     Written::Nothing,
                     ClientConnectorState::ChannelConnection {
@@ -418,7 +505,7 @@ impl Sequence for ClientConnector {
                         channel_connection: if skip_channel_join {
                             ChannelConnectionSequence::skip_channel_join()
                         } else {
-                            ChannelConnectionSequence::new(io_channel_id, static_channel_ids)
+                            ChannelConnectionSequence::new(io_channel_id, channel_ids_to_join)
                         },
                     },
                 )
@@ -464,6 +551,10 @@ impl Sequence for ClientConnector {
                 user_channel_id,
             } => {
                 debug!("Secure Settings Exchange");
+
+                // Autodetect requests can start right after the Client Info
+                // PDU; responses need our user channel id as initiator.
+                self.user_channel_id = Some(user_channel_id);
 
                 let client_info = create_client_info_pdu(&self.config, &self.client_addr);
 
@@ -592,6 +683,7 @@ impl Sequence for ClientConnector {
                                 pointer_software_rendering,
                                 connection_activation,
                                 compression_type: self.config.compression_type,
+                                message_channel_id: self.message_channel_id,
                             },
                         },
                         _ => return Err(general_err!("invalid state (this is a bug)")),
@@ -609,6 +701,28 @@ impl Sequence for ClientConnector {
         self.state = next_state;
 
         Ok(written)
+    }
+}
+
+/// A payload prefixed with a Basic Security Header — the framing used by
+/// message-channel PDUs such as autodetect responses (MS-RDPBCGR 2.2.14.2).
+struct SecurityHeaderWrapped<'a, T> {
+    header: rdp::headers::BasicSecurityHeader,
+    inner: &'a T,
+}
+
+impl<T: Encode> Encode for SecurityHeaderWrapped<'_, T> {
+    fn encode(&self, dst: &mut ironrdp_core::WriteCursor<'_>) -> ironrdp_core::EncodeResult<()> {
+        self.header.encode(dst)?;
+        self.inner.encode(dst)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn size(&self) -> usize {
+        self.header.size() + self.inner.size()
     }
 }
 
@@ -692,10 +806,16 @@ fn create_gcc_blocks<'a>(
                 high_color_depth: Some(high_color_depth),
                 supported_color_depths: Some(supported_color_depths),
                 early_capability_flags: {
+                    // SUPPORT_NET_CHAR_AUTODETECT: we answer the server's RTT
+                    // and bandwidth measurements (connect-time in this
+                    // connector, continuous in the session's x224 processor).
+                    // Some servers gate features on this — GNOME Remote
+                    // Desktop disables audio redirection without it.
                     let mut early_capability_flags = ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE
                         | ClientEarlyCapabilityFlags::SUPPORT_ERR_INFO_PDU
                         | ClientEarlyCapabilityFlags::STRONG_ASYMMETRIC_KEYS
-                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN;
+                        | ClientEarlyCapabilityFlags::SUPPORT_SKIP_CHANNELJOIN
+                        | ClientEarlyCapabilityFlags::SUPPORT_NET_CHAR_AUTODETECT;
 
                     // TODO(#136): support for ClientEarlyCapabilityFlags::SUPPORT_STATUS_INFO_PDU
 
@@ -747,8 +867,10 @@ fn create_gcc_blocks<'a>(
         monitor: (!config.monitors.is_empty()).then(|| gcc::ClientMonitorData {
             monitors: config.monitors.clone(),
         }),
-        // TODO(#140): support for Client Message Channel Data (https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/f50e791c-de03-4b25-b17e-e914c9020bc3)
-        message_channel: None,
+        // Request the MCS message channel: FreeRDP-based servers carry all
+        // network-detection traffic on it (and grd requires network detection
+        // for audio redirection).
+        message_channel: Some(gcc::ClientMessageChannelData),
         multi_transport_channel: config
             .multitransport_flags
             .map(|flags| gcc::MultiTransportChannelData { flags }),
