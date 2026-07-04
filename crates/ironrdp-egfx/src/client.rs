@@ -295,6 +295,18 @@ pub trait GraphicsPipelineHandler: Send {
     ) {
     }
 
+    /// Reads back the current RGBA pixels of a surface rectangle, if the
+    /// embedder keeps a surface framebuffer. Used to seed ClearCodec decodes:
+    /// ClearCodec can encode a rectangle as a delta, leaving gaps that must
+    /// retain existing surface content (FreeRDP decodes straight into the
+    /// surface, so gaps are preserved). Returning `None` (the default) seeds
+    /// with black, which is correct only for full-coverage tiles.
+    ///
+    /// Returns `width * height * 4` RGBA bytes on success.
+    fn read_surface_rect(&self, _surface_id: u16, _x: u16, _y: u16, _width: u16, _height: u16) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Called when a logical frame is complete
     ///
     /// All bitmap updates between the corresponding `StartFrame`
@@ -429,6 +441,11 @@ pub struct GraphicsPipelineClient {
     /// RDP 6.0 Planar codec decoder (reused for its internal plane buffer).
     /// xrdp's GFX delivers tiles via WireToSurface1 with `codecId = Planar`.
     planar_decoder: ironrdp_graphics::rdp6::BitmapStreamDecoder,
+    /// ClearCodec decoder — mandatory for CAPVERSION_8+; Windows paints text
+    /// and UI regions with it (WireToSurface1, `codecId = ClearCodec`).
+    /// Stateful for the whole session: its glyph/vBar caches survive
+    /// ResetGraphics by design (MS-RDPEGFX 3.3.1.4).
+    clear_decoder: ironrdp_graphics::clear_codec::ClearDecoder,
 
     state: ClientState,
     negotiated_caps: Option<CapabilitySet>,
@@ -452,6 +469,7 @@ impl GraphicsPipelineClient {
             decompressor: zgfx::Decompressor::new(),
             decompressed_buffer: Vec::new(),
             planar_decoder: ironrdp_graphics::rdp6::BitmapStreamDecoder::default(),
+            clear_decoder: ironrdp_graphics::clear_codec::ClearDecoder::new(),
             state: ClientState::WaitingForConfirm,
             negotiated_caps: None,
             codec_caps: CodecCapabilities::default(),
@@ -776,6 +794,9 @@ impl GraphicsPipelineClient {
             Codec1Type::Planar => {
                 self.decode_planar(pdu);
             }
+            Codec1Type::ClearCodec => {
+                self.decode_clear(pdu);
+            }
             _ => {
                 trace!(codec_id = ?pdu.codec_id, "Forwarding unsupported codec to handler");
                 self.handler.on_unhandled_pdu(&GfxPdu::WireToSurface1(pdu));
@@ -896,6 +917,47 @@ impl GraphicsPipelineClient {
             surface_id: pdu.surface_id,
             destination_rectangle: pdu.destination_rectangle,
             codec_id: Codec1Type::Planar,
+            data: rgba,
+            width: dest_width,
+            height: dest_height,
+        };
+        self.handler.on_bitmap_updated(&update);
+    }
+
+    /// Decode a ClearCodec-coded tile and deliver it as an RGBA [`BitmapUpdate`].
+    /// ClearCodec layers can be sparse (a delta), so we seed the scratch with
+    /// the surface's current pixels for this rect before decoding — otherwise
+    /// unpainted pixels would show through as black. Falls back to a black
+    /// seed if the handler doesn't expose surface readback.
+    fn decode_clear(&mut self, pdu: crate::pdu::WireToSurface1Pdu) {
+        let dest_width = pdu.destination_rectangle.width();
+        let dest_height = pdu.destination_rectangle.height();
+        let expected = usize::from(dest_width) * usize::from(dest_height) * 4;
+
+        let mut rgba = self
+            .handler
+            .read_surface_rect(
+                pdu.surface_id,
+                pdu.destination_rectangle.left,
+                pdu.destination_rectangle.top,
+                dest_width,
+                dest_height,
+            )
+            .filter(|seed| seed.len() == expected)
+            .unwrap_or_else(|| vec![0u8; expected]);
+
+        if let Err(e) = self
+            .clear_decoder
+            .decode(&pdu.bitmap_data, dest_width, dest_height, &mut rgba)
+        {
+            warn!(error = %e, surface_id = pdu.surface_id, "ClearCodec decode failed");
+            return;
+        }
+
+        let update = BitmapUpdate {
+            surface_id: pdu.surface_id,
+            destination_rectangle: pdu.destination_rectangle,
+            codec_id: Codec1Type::ClearCodec,
             data: rgba,
             width: dest_width,
             height: dest_height,
