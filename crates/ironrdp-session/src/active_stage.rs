@@ -197,6 +197,9 @@ impl ActiveStage {
                 UpdateKind::PointerBitmap(pointer) => {
                     stage_outputs.push(ActiveStageOutput::PointerBitmap(pointer));
                 }
+                UpdateKind::Orders(data) => {
+                    stage_outputs.push(ActiveStageOutput::Orders(data));
+                }
             }
         }
 
@@ -363,6 +366,9 @@ pub enum ActiveStageOutput {
         y: u16,
     },
     PointerBitmap(Arc<DecodedPointer>),
+    /// Raw drawing-orders payload (numberOrders + orderData) passed through
+    /// undecoded. Sent by RAIL servers as altsec window orders (MS-RDPERP).
+    Orders(Vec<u8>),
     Terminate(GracefulDisconnectReason),
     DeactivateAll(Box<ConnectionActivationSequence>),
     /// Server Initiate Multitransport Request. The application should establish a
@@ -460,8 +466,20 @@ fn process_slow_path_graphics(
             fast_path_processor.process_bitmap_update(image, bitmap)
         }
         GraphicsUpdateType::Orders => {
-            warn!("Slow-path drawing orders not supported (MS-RDPEGDI)");
-            Ok(Vec::new())
+            // Slow-path TS_UPDATE_ORDERS is pad2 + numberOrders + pad2 + orderData;
+            // normalize to the fast-path shape (numberOrders + orderData) so
+            // consumers parse one layout (RAIL altsec window orders).
+            if src.len() < 6 {
+                warn!("Truncated slow-path orders update");
+                return Ok(Vec::new());
+            }
+            let _pad = src.read_u16();
+            let number_orders = src.read_u16();
+            let _pad = src.read_u16();
+            let mut payload = Vec::with_capacity(2 + src.len());
+            payload.extend_from_slice(&number_orders.to_le_bytes());
+            payload.extend_from_slice(src.remaining());
+            Ok(vec![UpdateKind::Orders(payload)])
         }
         GraphicsUpdateType::Palette => {
             warn!("Slow-path palette update not supported (8bpp)");

@@ -212,6 +212,12 @@ pub struct Config {
     pub alternate_shell: String,
     /// Working directory for the alternate shell
     pub work_dir: String,
+    /// If true, request a RemoteApp (RAIL, MS-RDPERP) session: sets the
+    /// INFO_RAIL flag in the Client Info PDU and advertises the Remote
+    /// Programs + Window List capability sets in the Confirm Active PDU.
+    /// The application is launched via the RAIL Client Execute PDU on the
+    /// "rail" static virtual channel, not via `alternate_shell`.
+    pub enable_remote_apps: bool,
     pub platform: capability_sets::MajorPlatformType,
     /// Unique identifier for the computer
     ///

@@ -160,6 +160,18 @@ impl Sequence for ConnectionActivationSequence {
                     }
                 }
 
+                // A RAIL server must advertise the Remote Programs capability set
+                // in its Demand Active (MS-RDPERP 1.3.2.1). Fail with a distinct,
+                // matchable reason instead of proceeding into a broken session.
+                if self.config.enable_remote_apps
+                    && !capability_sets.iter().any(|c| matches!(c, CapabilitySet::Rail(_)))
+                {
+                    return Err(reason_err!(
+                        "ConnectionActivation::CapabilitiesExchange",
+                        "server does not support RemoteApp"
+                    ));
+                }
+
                 // At this point we have already sent a requested desktop size to the server -- either as a part of the
                 // [`TS_UD_CS_CORE`] (on initial connection) or the [`DISPLAYCONTROL_MONITOR_LAYOUT`] (on resize event).
                 //
@@ -424,6 +436,16 @@ fn create_client_confirm_active(
         server_capability_sets.push(CapabilitySet::MultiFragmentUpdate(MultifragmentUpdate {
             max_request_size: 8 * 1024 * 1024, // 8 MB
         }));
+    }
+
+    if config.enable_remote_apps {
+        // RAIL capability sets (MS-RDPERP 2.2.1.1) as raw bodies:
+        // - Remote Programs: RailSupportLevel = TS_RAIL_LEVEL_SUPPORTED (0x1)
+        //   only — no HANDSHAKE_EX bit, so the server sends a plain Handshake.
+        // - Window List: WndSupportLevel = TS_WINDOW_LEVEL_SUPPORTED_EX (2),
+        //   NumIconCaches = 3, NumIconCacheEntries = 12 (FreeRDP defaults).
+        server_capability_sets.push(CapabilitySet::Rail(vec![0x01, 0x00, 0x00, 0x00]));
+        server_capability_sets.push(CapabilitySet::WindowList(vec![0x02, 0x00, 0x00, 0x00, 0x03, 0x0C, 0x00]));
     }
 
     ClientConfirmActive {

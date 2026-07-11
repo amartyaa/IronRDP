@@ -154,6 +154,10 @@ impl StaticVirtualChannel {
         self.channel_processor.compression_condition()
     }
 
+    pub fn channel_options(&self) -> ChannelOptions {
+        self.channel_processor.channel_options()
+    }
+
     pub fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
         self.channel_processor.start()
     }
@@ -268,6 +272,14 @@ pub trait SvcProcessor: AsAny + fmt::Debug + Send {
     /// Defines which compression flag should be sent along the [`ChannelDef`] Definition Structure (`CHANNEL_DEF`)
     fn compression_condition(&self) -> CompressionCondition {
         CompressionCondition::Never
+    }
+
+    /// Extra GCC [`ChannelOptions`] for this channel's `CHANNEL_DEF`, OR'd with
+    /// the compression flag from [`Self::compression_condition`]. Channels that
+    /// need to match mstsc's declaration (e.g. rail: INITIALIZED | ENCRYPT_RDP |
+    /// COMPRESS_RDP | SHOW_PROTOCOL, per FreeRDP rail_main.c) override this.
+    fn channel_options(&self) -> ChannelOptions {
+        ChannelOptions::empty()
     }
 
     /// Start a channel, after the connection is established and the channel is joined.
@@ -424,11 +436,12 @@ impl Default for ChunkProcessor {
 
 /// Builds the [`ChannelOptions`] bitfield to be used in the [`ChannelDef`] structure.
 pub fn make_channel_options(channel: &StaticVirtualChannel) -> ChannelOptions {
-    match channel.compression_condition() {
+    let compression = match channel.compression_condition() {
         CompressionCondition::Never => ChannelOptions::empty(),
         CompressionCondition::WhenRdpDataIsCompressed => ChannelOptions::COMPRESS_RDP,
         CompressionCondition::Always => ChannelOptions::COMPRESS,
-    }
+    };
+    compression | channel.channel_options()
 }
 
 /// Builds the [`ChannelDef`] structure containing information for this channel.

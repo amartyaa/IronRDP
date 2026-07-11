@@ -34,6 +34,9 @@ pub enum UpdateKind {
     PointerHidden,
     PointerPosition { x: u16, y: u16 },
     PointerBitmap(Arc<DecodedPointer>),
+    /// Raw TS_FP_UPDATE_ORDERS payload (numberOrders + orderData), passed
+    /// through undecoded for RAIL window-order parsing (MS-RDPERP).
+    Orders(Vec<u8>),
 }
 
 pub struct Processor {
@@ -174,6 +177,10 @@ impl Processor {
             Ok(FastPathUpdate::Palette(palette_data)) => {
                 trace!("Received palette update");
                 self.palette.process_update(palette_data);
+            }
+            Ok(FastPathUpdate::Orders(orders_data)) => {
+                trace!("Received orders update ({} bytes)", orders_data.len());
+                processor_updates.push(UpdateKind::Orders(orders_data.to_vec()));
             }
             Err(e) => {
                 // FIXME: This seems to be a way of special-handling the error case in FastPathUpdate::decode_cursor_with_code

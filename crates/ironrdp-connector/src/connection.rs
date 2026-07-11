@@ -917,6 +917,12 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
         flags |= ClientInfoFlags::NO_AUDIO_PLAYBACK;
     }
 
+    if config.enable_remote_apps {
+        // Classic RAIL only: HIDEF_RAIL_SUPPORTED (Enhanced RemoteApp) is
+        // deliberately not set yet; servers fall back to classic per MS-RDPERP.
+        flags |= ClientInfoFlags::RAIL;
+    }
+
     // Advertise bulk compression support if configured
     let compression_type = if let Some(ct) = config.compression_type {
         flags |= ClientInfoFlags::COMPRESSION;
