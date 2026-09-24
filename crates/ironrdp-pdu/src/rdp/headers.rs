@@ -116,7 +116,12 @@ impl Encode for ShareControlHeader {
 
 impl<'de> Decode<'de> for ShareControlHeader {
     fn decode(src: &mut ReadCursor<'de>) -> DecodeResult<Self> {
-        ensure_fixed_part_size!(in: src);
+        // Only the 6-byte share control header proper is required up front.
+        // The shareId that makes up the rest of FIXED_PART_SIZE is validated
+        // per PDU type below, because not every server sends one (xrdp's
+        // Deactivate All is header-only). FIXED_PART_SIZE itself is left alone
+        // — `size()` uses it for encoding.
+        ensure_size!(in: src, size: 6);
 
         let total_length = usize::from(src.read_u16());
         let pdu_type_with_version = src.read_u16();
@@ -136,6 +141,18 @@ impl<'de> Decode<'de> for ShareControlHeader {
         let share_id = if pdu_type == ShareControlPduType::ServerRedirect {
             ensure_size!(in: src, size: 2);
             read_padding!(src, 2);
+            0
+        } else if pdu_type == ShareControlPduType::DeactivateAllPdu && src.len() < 4 {
+            // xrdp answers a DisplayControl resize with a Deactivate All that is
+            // *only* the share control header — totalLength == 6, no shareId and
+            // no sourceDescriptor, despite [2.2.3.1] specifying both. FreeRDP
+            // tolerates the short form (see `ServerDeactivateAll::decode`, which
+            // already does), but rejecting it here means we never reach that
+            // decoder: the Deactivation-Reactivation Sequence is abandoned, the
+            // server waits forever for a Confirm Active, and the session freezes
+            // until the user reconnects.
+            //
+            // [2.2.3.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/8a29971a-df3c-48da-add2-8ed9a05edc89
             0
         } else {
             ensure_size!(in: src, size: 4);
@@ -961,5 +978,43 @@ mod server_redirection_tests {
         assert_eq!(packet.load_balance_info.as_deref(), Some(cookie.as_slice()));
         assert_eq!(packet.user_name.as_deref(), Some(user.as_slice()));
         assert_eq!(packet.password, None);
+    }
+
+    /// xrdp's answer to a DisplayControl resize: a Deactivate All that is only
+    /// the share control header — totalLength 6, no shareId, no
+    /// sourceDescriptor. Captured off the wire from xrdp 0.10.1. Rejecting it
+    /// abandons the Deactivation-Reactivation Sequence and the session freezes
+    /// until reconnect.
+    #[test]
+    fn decodes_short_deactivate_all_without_share_id() {
+        let wire: [u8; 6] = [0x06, 0x00, 0x16, 0x00, 0xee, 0x03];
+
+        let mut cursor = ReadCursor::new(&wire);
+        let header = ShareControlHeader::decode(&mut cursor).expect("short Deactivate All must decode");
+
+        assert_eq!(header.pdu_source, 0x03ee);
+        assert_eq!(header.share_id, 0);
+        assert!(
+            matches!(header.share_control_pdu, ShareControlPdu::ServerDeactivateAll(_)),
+            "expected ServerDeactivateAll, got {}",
+            header.share_control_pdu.as_short_name()
+        );
+    }
+
+    /// The normal, spec-shaped Deactivate All still yields its shareId.
+    #[test]
+    fn decodes_full_deactivate_all_with_share_id() {
+        let mut wire = Vec::new();
+        wire.extend(13u16.to_le_bytes()); // totalLength
+        wire.extend((PROTOCOL_VERSION | ShareControlPduType::DeactivateAllPdu.as_u16()).to_le_bytes());
+        wire.extend(0x03eeu16.to_le_bytes()); // pduSource
+        wire.extend(0x0001_03eau32.to_le_bytes()); // shareId
+        wire.extend(1u16.to_le_bytes()); // lengthSourceDescriptor
+        wire.push(0x00); // sourceDescriptor
+
+        let mut cursor = ReadCursor::new(&wire);
+        let header = ShareControlHeader::decode(&mut cursor).expect("decode");
+        assert_eq!(header.share_id, 0x0001_03ea);
+        assert!(matches!(header.share_control_pdu, ShareControlPdu::ServerDeactivateAll(_)));
     }
 }
